@@ -2,6 +2,7 @@ use rand::prelude::*;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufReader, Read, Write, stdout};
+use std::time::SystemTime;
 use std::{env, f32};
 
 trait FromBytes {
@@ -148,8 +149,8 @@ struct Weights {
     rms_final_weight: Vec<f32>, // (dim,)
 
     // freq_cis for RoPE relatively positional embeddings
-    freq_cis_real: Vec<f32>, // (max_seq_len, dim/2)
-    freq_cis_imag: Vec<f32>, // (max_seq_len, dim/2)
+    freq_cis_real: Vec<f32>, // (max_seq_len, head_size/2)
+    freq_cis_imag: Vec<f32>, // (max_seq_len, head_size/2)
 }
 
 impl Weights {
@@ -187,27 +188,35 @@ impl KVCache {
     }
 }
 
+/// Apply RMSNorm for each row of a 2D tensor x (n, weight.len())
 fn rmsnorm(x: &Vec<f32>, weight: &[f32]) -> Vec<f32> {
     let mut o = vec![0.0; x.len()];
-    // mean sum of squares
-    let mss: f32 = x.iter().map(|&y| y * y).sum::<f32>() / (x.len() as f32);
-    let rsqrt: f32 = 1.0 / (mss + 1e-5f32).sqrt();
-    for ((oi, xi), wi) in o.iter_mut().zip(&x[..]).zip(weight) {
-        *oi = *wi * rsqrt * *xi;
+    for r in 0..(x.len() / weight.len()) {
+        let x = &x[r * weight.len()..(r + 1) * weight.len()];
+        let o = &mut o[r * weight.len()..(r + 1) * weight.len()];
+
+        // mean sum of squares
+        let mss: f32 = x.iter().map(|&y| y * y).sum::<f32>() / (x.len() as f32);
+        let rsqrt: f32 = 1.0 / (mss + 1e-5f32).sqrt();
+        for ((oi, xi), wi) in o.iter_mut().zip(&x[..]).zip(weight) {
+            *oi = *wi * rsqrt * *xi;
+        }
     }
 
     o
 }
 
-fn matmul(x: &Vec<f32>, w: &[f32], n: usize, d: usize) -> Vec<f32> {
-    // w (d,n) @ x (n,1) -> (d,1)
-    let mut o = vec![0.0; d];
-    for i in 0..d {
-        let mut val: f32 = 0.0;
-        for j in 0..n {
-            val += w[i * n + j] * x[j];
+fn matmul(x: &Vec<f32>, w: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    // x (m, k) @ w (n, k)^T -> (m, n)
+    let mut o = vec![0.0; m * n];
+    for r in 0..m {
+        for c in 0..n {
+            let mut val: f32 = 0.0;
+            for i in 0..k {
+                val += x[r * k + i] * w[c * k + i];
+            }
+            o[r * n + c] = val;
         }
-        o[i] = val;
     }
 
     o
@@ -234,19 +243,34 @@ impl Model {
     }
 }
 
-fn decode(token: usize, pos: usize, model: &Model, kv_cache: &mut KVCache) -> Vec<f32> {
+enum Stage {
+    Prefill,
+    Decode,
+}
+
+fn inference(
+    tokens: Vec<usize>,
+    pos: usize, // pos of the first token in tokens
+    model: &Model,
+    kv_cache: &mut KVCache,
+    stage: Stage,
+) -> Vec<f32> {
     let head_size = model.config.dim / model.config.n_heads;
 
     // positional embedding
     let freq_cis_real_row =
-        &model.weights.freq_cis_real[pos * (head_size / 2)..(pos + 1) * (head_size / 2)];
+        &model.weights.freq_cis_real[pos * (head_size / 2)..(pos + tokens.len()) * (head_size / 2)];
     let freq_cis_imag_row =
-        &model.weights.freq_cis_imag[pos * (head_size / 2)..(pos + 1) * (head_size / 2)];
+        &model.weights.freq_cis_imag[pos * (head_size / 2)..(pos + tokens.len()) * (head_size / 2)];
 
-    // embed token into input vector x
-    let mut x = model.weights.token_embedding_table
-        [token * (model.config.dim)..(token + 1) * (model.config.dim)]
-        .to_vec();
+    // embed tokens into input vector x
+    let mut x: Vec<f32> = Vec::new(); // (n, dim)
+    for token in tokens.iter() {
+        x.extend(
+            &model.weights.token_embedding_table
+                [token * (model.config.dim)..(token + 1) * (model.config.dim)],
+        );
+    }
 
     // run through layers
     for layer in 0..model.config.n_layers {
@@ -262,83 +286,98 @@ fn decode(token: usize, pos: usize, model: &Model, kv_cache: &mut KVCache) -> Ve
             &rms_normed_x,
             &model.weights.wq[layer * (model.config.dim) * (model.config.dim)
                 ..(layer + 1) * (model.config.dim) * (model.config.dim)],
+            tokens.len(),
             model.config.dim,
             model.config.dim,
-        ); // wq (dim, dim) @ rms_normed_x (dim, 1) -> query (dim, 1)
+        ); // rms_normed_x (n, dim) @ wq^T (dim, dim) -> query (n, dim)
         let mut key = matmul(
             &rms_normed_x,
             &model.weights.wk[layer * (model.config.dim) * (model.config.dim)
                 ..(layer + 1) * (model.config.dim) * (model.config.dim)],
+            tokens.len(),
             model.config.dim,
             model.config.dim,
-        ); // wk (dim, dim) @ rms_normed_x (dim, 1) -> key (dim, 1)
+        ); // rms_normed_x (n, dim) @ wk^T (dim, dim) -> key (n, dim)
         let value = matmul(
             &rms_normed_x,
             &model.weights.wv[layer * (model.config.dim) * (model.config.dim)
                 ..(layer + 1) * (model.config.dim) * (model.config.dim)],
+            tokens.len(),
             model.config.dim,
             model.config.dim,
-        ); // wv (dim, dim) @ rms_normed_x (dim, 1) -> value (dim, 1)
+        ); // rms_normed_x (n, dim) @ wv^T (dim, dim) -> value (n, dim)
 
         // rotary positional embedding
-        for head in 0..model.config.n_heads {
-            let head_query = &mut query[head * head_size..(head + 1) * head_size];
-            let head_key = &mut key[head * head_size..(head + 1) * head_size];
-
-            for i in 0..(head_size / 2) {
-                let (fcr, fci) = (freq_cis_real_row[i], freq_cis_imag_row[i]);
-                // rotate
-                (head_query[i * 2], head_query[i * 2 + 1]) = (
-                    head_query[i * 2] * fcr - head_query[i * 2 + 1] * fci,
-                    head_query[i * 2] * fci + head_query[i * 2 + 1] * fcr,
-                );
-                (head_key[i * 2], head_key[i * 2 + 1]) = (
-                    head_key[i * 2] * fcr - head_key[i * 2 + 1] * fci,
-                    head_key[i * 2] * fci + head_key[i * 2 + 1] * fcr,
-                );
+        for ti in 0..tokens.len() {
+            for head in 0..model.config.n_heads {
+                let head_query = &mut query[ti * (model.config.dim) + head * head_size
+                    ..ti * (model.config.dim) + (head + 1) * head_size];
+                let head_key = &mut key[ti * (model.config.dim) + head * head_size
+                    ..ti * (model.config.dim) + (head + 1) * head_size];
+                for i in 0..(head_size / 2) {
+                    let (fcr, fci) = (
+                        freq_cis_real_row[ti * (head_size / 2) + i],
+                        freq_cis_imag_row[ti * (head_size / 2) + i],
+                    );
+                    // rotate
+                    (head_query[i * 2], head_query[i * 2 + 1]) = (
+                        head_query[i * 2] * fcr - head_query[i * 2 + 1] * fci,
+                        head_query[i * 2] * fci + head_query[i * 2 + 1] * fcr,
+                    );
+                    (head_key[i * 2], head_key[i * 2 + 1]) = (
+                        head_key[i * 2] * fcr - head_key[i * 2 + 1] * fci,
+                        head_key[i * 2] * fci + head_key[i * 2 + 1] * fcr,
+                    );
+                }
             }
         }
 
         // cache kv values
         let layer_offset = layer * model.config.max_seq_len * model.config.dim;
         kv_cache.key_cache[(layer_offset + pos * model.config.dim)
-            ..(layer_offset + (pos + 1) * model.config.dim)]
+            ..(layer_offset + (pos + tokens.len()) * model.config.dim)]
             .copy_from_slice(&key);
         kv_cache.value_cache[(layer_offset + pos * model.config.dim)
-            ..(layer_offset + (pos + 1) * model.config.dim)]
+            ..(layer_offset + (pos + tokens.len()) * model.config.dim)]
             .copy_from_slice(&value);
 
-        let mut attention_output = vec![0.0; model.config.dim];
+        let mut attention_output = vec![0.0; tokens.len() * model.config.dim];
         // multihead attention
-        for head in 0..model.config.n_heads {
-            let head_query = &query[head * head_size..(head + 1) * head_size];
-            let mut scores = vec![0.0; pos + 1];
-            for i in 0..(pos + 1) {
-                let head_key_offset = layer_offset + i * model.config.dim + head * head_size;
-                let head_key = &kv_cache.key_cache[head_key_offset..(head_key_offset + head_size)]; // key of the i-th position
-                // compute attention score
-                scores[i] = head_query
-                    .iter()
-                    .zip(head_key.iter()) // (head_query[i], head_key[i]) pairs
-                    .map(|(&qi, &ki)| qi * ki)
-                    .sum::<f32>()
-                    / (head_size as f32).sqrt();
-            }
+        for ti in 0..tokens.len() {
+            for head in 0..model.config.n_heads {
+                let token_query = &query[ti * model.config.dim..(ti + 1) * model.config.dim];
+                let head_query = &token_query[head * head_size..(head + 1) * head_size];
+                let mut scores = vec![0.0; pos + ti + 1];
+                for i in 0..(pos + ti + 1) {
+                    let head_key_offset = layer_offset + i * model.config.dim + head * head_size;
+                    let head_key =
+                        &kv_cache.key_cache[head_key_offset..(head_key_offset + head_size)]; // key of the i-th position
+                    // compute attention score
+                    scores[i] = head_query
+                        .iter()
+                        .zip(head_key.iter()) // (head_query[i], head_key[i]) pairs
+                        .map(|(&qi, &ki)| qi * ki)
+                        .sum::<f32>()
+                        / (head_size as f32).sqrt();
+                }
 
-            softmax(&mut scores);
+                softmax(&mut scores);
 
-            // prepare buffer to store weighted sum of values
-            let head_attention_output =
-                &mut attention_output[head * head_size..(head + 1) * head_size];
-            for i in 0..(pos + 1) {
-                let head_value_offset = layer_offset + i * model.config.dim + head * head_size;
-                let head_value =
-                    &kv_cache.value_cache[head_value_offset..(head_value_offset + head_size)]; // value of the i-th position
-                let score = scores[i];
-                head_attention_output
-                    .iter_mut()
-                    .zip(head_value)
-                    .for_each(|(oi, &vi)| *oi += score * vi);
+                // prepare buffer to store weighted sum of values
+                let token_attention_output =
+                    &mut attention_output[ti * model.config.dim..(ti + 1) * model.config.dim];
+                let head_attention_output =
+                    &mut token_attention_output[head * head_size..(head + 1) * head_size];
+                for i in 0..(pos + ti + 1) {
+                    let head_value_offset = layer_offset + i * model.config.dim + head * head_size;
+                    let head_value =
+                        &kv_cache.value_cache[head_value_offset..(head_value_offset + head_size)]; // value of the i-th position
+                    let score = scores[i];
+                    head_attention_output
+                        .iter_mut()
+                        .zip(head_value)
+                        .for_each(|(oi, &vi)| *oi += score * vi);
+                }
             }
         }
 
@@ -347,9 +386,10 @@ fn decode(token: usize, pos: usize, model: &Model, kv_cache: &mut KVCache) -> Ve
             &attention_output,
             &model.weights.wo[layer * (model.config.dim) * (model.config.dim)
                 ..(layer + 1) * (model.config.dim) * (model.config.dim)],
+            tokens.len(),
             model.config.dim,
             model.config.dim,
-        ); // wo (dim, dim) @ attention_output (dim, 1) -> attention_output (dim, 1)
+        ); // attention_output (n, dim) @ wo^T (dim, dim) -> attention_output (n, dim)
 
         // residual connection -- add back to x
         x.iter_mut()
@@ -368,16 +408,18 @@ fn decode(token: usize, pos: usize, model: &Model, kv_cache: &mut KVCache) -> Ve
             &rms_normed_x,
             &model.weights.w1[layer * (model.config.hidden_dim) * (model.config.dim)
                 ..(layer + 1) * (model.config.hidden_dim) * (model.config.dim)],
+            tokens.len(),
             model.config.dim,
             model.config.hidden_dim,
-        ); // w1 (hidden_dim, dim) @ rms_normed_x (dim, 1) -> fnn1 (hidden_dim, 1)
+        ); // rms_normed_x (n, dim) @ w1^T (dim, hidden_dim)  -> fnn1 (n, hidden_dim)
         let fnn3 = matmul(
             &rms_normed_x,
             &model.weights.w3[layer * (model.config.hidden_dim) * (model.config.dim)
                 ..(layer + 1) * (model.config.hidden_dim) * (model.config.dim)],
+            tokens.len(),
             model.config.dim,
             model.config.hidden_dim,
-        ); // w3 (hidden_dim, dim) @ rms_normed_x (dim, 1) -> fnn3 (hidden_dim, 1)
+        ); // rms_normed_x (n, dim) @ w3^T (dim, hidden_dim) @  -> fnn3 (n, hidden_dim)
 
         // apply silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
         fnn1.iter_mut()
@@ -390,14 +432,19 @@ fn decode(token: usize, pos: usize, model: &Model, kv_cache: &mut KVCache) -> Ve
             &fnn1,
             &model.weights.w2[layer * (model.config.dim) * (model.config.hidden_dim)
                 ..(layer + 1) * (model.config.dim) * (model.config.hidden_dim)],
+            tokens.len(),
             model.config.hidden_dim,
             model.config.dim,
-        ); // w2 (dim, hidden_dim) @ fnn1 (hidden_dim, 1) -> fnn_output (dim, 1)
+        ); // fnn1 (n, hidden_dim) @ w2^T (hidden_dim, dim) -> fnn_output (n, dim)
 
         // residual connection
         x.iter_mut()
             .zip(fnn_output.iter())
             .for_each(|(xi, &oi)| *xi += oi);
+    }
+
+    if matches!(stage, Stage::Prefill) {
+        return Vec::new();
     }
 
     // final rmsnorm
@@ -407,9 +454,10 @@ fn decode(token: usize, pos: usize, model: &Model, kv_cache: &mut KVCache) -> Ve
     let logits = matmul(
         &x,
         &model.weights.token_embedding_table,
+        tokens.len(),
         model.config.dim,
         model.config.vocab_size,
-    ); // token_embedding_table (vocab_size, dim) @ x (dim, 1) -> logits (vocab_size, 1)
+    ); // x (n, dim) @ token_embedding_table^T (dim, vocab_size) @  -> logits (n, vocab_size)
     logits
 }
 
@@ -473,7 +521,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(p) => String::from(p.trim()),
         None => String::new(),
     };
-    let prompt_tokens = match prompt.len() {
+    let mut prompt_tokens = match prompt.len() {
         0 => Vec::new(),
         _ => tokenizer.encode(prompt.as_bytes()),
     };
@@ -481,19 +529,33 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Main generation loop.
     let mut kv_cache = KVCache::new(&model.config);
-    let mut next;
-    let mut token = 1; // token 1 is <s> (bos) in the vocab
-    let mut pos: usize = 0;
-    let mut rng = rand::rng();
-    println!("<s>");
-    while pos < steps {
-        let logits = decode(token, pos, &model, &mut kv_cache);
+    prompt_tokens.insert(0, 1); // token 1 is <s> (bos) in the vocab
+    for token in prompt_tokens.iter() {
+        print!("{}", String::from_utf8(tokenizer.decode(*token)).unwrap());
+    }
+    stdout().flush()?;
 
-        if pos < prompt_tokens.len() {
-            next = prompt_tokens[pos];
-        } else {
-            next = sample(logits, temperature, &mut rng);
-        }
+    let start_time = SystemTime::now();
+
+    // prefill
+    if prompt_tokens.len() > 1 {
+        inference(
+            prompt_tokens[0..prompt_tokens.len() - 1].to_vec(),
+            0,
+            &model,
+            &mut kv_cache,
+            Stage::Prefill,
+        );
+    }
+
+    // decode
+    let mut rng = rand::rng();
+    let mut pos: usize = prompt_tokens.len() - 1;
+    let mut token: usize = prompt_tokens[prompt_tokens.len() - 1];
+    while pos < steps {
+        let logits = inference(vec![token], pos, &model, &mut kv_cache, Stage::Decode);
+
+        let next = sample(logits, temperature, &mut rng);
 
         print!("{}", String::from_utf8(tokenizer.decode(next)).unwrap());
         stdout().flush()?;
@@ -501,6 +563,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         token = next;
         pos += 1;
     }
+
+    let elapsed_time = start_time.elapsed().unwrap();
+    println!();
+    println!("--------------------------------");
+    println!(
+        "elapsed: {}.{:03} s, avg tok/s: {}",
+        elapsed_time.as_secs(),
+        elapsed_time.subsec_millis(),
+        (steps - 1) as f32 / elapsed_time.as_secs_f32()
+    );
 
     Ok(())
 }
