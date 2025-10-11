@@ -2,6 +2,7 @@ use rand::prelude::*;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufReader, Read, Write, stdout};
+use std::thread;
 use std::time::SystemTime;
 use std::{env, f32};
 
@@ -208,16 +209,29 @@ fn rmsnorm(x: &Vec<f32>, weight: &[f32]) -> Vec<f32> {
 
 fn matmul(x: &Vec<f32>, w: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     // x (m, k) @ w (n, k)^T -> (m, n)
+    let parallelism = 4;
+    assert!(n % parallelism == 0);
     let mut o = vec![0.0; m * n];
-    for r in 0..m {
-        for c in 0..n {
-            let mut val: f32 = 0.0;
-            for i in 0..k {
-                val += x[r * k + i] * w[c * k + i];
-            }
-            o[r * n + c] = val;
+    let o_addr = o.as_mut_ptr() as usize;
+    thread::scope(|s| {
+        for t in 0..parallelism {
+            // each thread calculates `parallelism` number of columns of the output matrix
+            s.spawn(move || {
+                let o_ptr = o_addr as *mut f32;
+                for r in 0..m {
+                    for c in t * (n / parallelism)..(t + 1) * (n / parallelism) {
+                        let mut val: f32 = 0.0;
+                        for i in 0..k {
+                            val += x[r * k + i] * w[c * k + i];
+                        }
+                        unsafe {
+                            o_ptr.add(r * n + c).write(val);
+                        }
+                    }
+                }
+            });
         }
-    }
+    });
 
     o
 }
