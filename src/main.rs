@@ -1,10 +1,11 @@
+use clap::Parser;
 use rand::prelude::*;
 use std::error::Error;
+use std::f32;
 use std::fs::File;
 use std::io::{BufReader, Read, Write, stdout};
 use std::thread;
 use std::time::SystemTime;
-use std::{env, f32};
 
 trait FromBytes {
     fn from_bytes(bytes: [u8; 4]) -> Self;
@@ -505,23 +506,28 @@ fn sample(mut logits: Vec<f32>, temperature: f32, rng: &mut impl Rng) -> usize {
     logits.len() - 1 // in case of rounding errors
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        println!(
-            "Usage: {} <checkpoint_file> [temperature] [steps] [prompt]",
-            &args[0]
-        );
-        return Ok(());
-    }
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Path to the model checkpoint file
+    #[arg(long)]
+    checkpoint: String,
 
-    let ckpt_file = &args[1];
-    let temperature: f32 = args.get(2).map_or(0.9, |x| x.parse().unwrap());
-    let steps: usize = args.get(3).map_or(256, |x| x.parse().unwrap());
-    println!("Model file: {ckpt_file}, temperature: {temperature}, step: {steps}");
+    #[arg(long)]
+    temperature: f32,
+
+    #[arg(long)]
+    steps: usize,
+
+    #[arg(long, default_value_t = String::new())]
+    prompt: String,
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
 
     // Load model
-    let model = Model::from_checkpoint(ckpt_file);
+    let model = Model::from_checkpoint(&args.checkpoint);
     assert!(
         model.config.n_kv_heads == model.config.n_heads,
         "MQA is not supported"
@@ -531,13 +537,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Load tokenizer
     let tokenizer = Tokenizer::from_file("tokenizer.bin", model.config.vocab_size);
 
-    let prompt = match args.get(4) {
-        Some(p) => String::from(p.trim()),
-        None => String::new(),
-    };
-    let mut prompt_tokens = match prompt.len() {
+    let mut prompt_tokens = match args.prompt.len() {
         0 => Vec::new(),
-        _ => tokenizer.encode(prompt.as_bytes()),
+        _ => tokenizer.encode(args.prompt.as_bytes()),
     };
     println!("Prompt tokens: {:?}", prompt_tokens);
 
@@ -566,10 +568,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut rng = rand::rng();
     let mut pos: usize = prompt_tokens.len() - 1;
     let mut token: usize = prompt_tokens[prompt_tokens.len() - 1];
-    while pos < steps {
+    while pos < args.steps {
         let logits = inference(vec![token], pos, &model, &mut kv_cache, Stage::Decode);
 
-        let next = sample(logits, temperature, &mut rng);
+        let next = sample(logits, args.temperature, &mut rng);
 
         print!("{}", String::from_utf8(tokenizer.decode(next)).unwrap());
         stdout().flush()?;
@@ -585,7 +587,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "elapsed: {}.{:03} s, avg tok/s: {}",
         elapsed_time.as_secs(),
         elapsed_time.subsec_millis(),
-        (steps - 1) as f32 / elapsed_time.as_secs_f32()
+        (args.steps - 1) as f32 / elapsed_time.as_secs_f32()
     );
 
     Ok(())

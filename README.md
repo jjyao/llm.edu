@@ -14,5 +14,5 @@ wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
 and then run:
 
 ```bash
-cargo run stories15M.bin 0.0 256 "Once upon a time"
+cargo run --release -- --checkpoint stories15M.bin --temperature 0.0 --steps 256 --prompt "Once upon a time"
 ```
