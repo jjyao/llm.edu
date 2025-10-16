@@ -250,6 +250,7 @@ impl Weights {
     }
 }
 
+/// https://medium.com/@plienhar/llm-inference-series-3-kv-caching-unveiled-048152e461c8
 struct KVCache {
     key_cache: Vec<f32>,   // (layer, max_seq_len, n_heads_per_shard * head_size)
     value_cache: Vec<f32>, // (layer, max_seq_len, n_heads_per_shard * head_size)
@@ -678,9 +679,10 @@ impl Worker {
         logits
     }
 
+    /// https://peterchng.com/blog/2023/05/02/token-selection-strategies-top-k-top-p-and-temperature/
     fn sample(&self, mut logits: Vec<f32>, rng: &mut impl Rng, temperature: f32) -> usize {
         if temperature == 0.0 {
-            // greedy decoding, choose argmax
+            // greedy decoding
             return logits
                 .iter()
                 .enumerate()
@@ -725,7 +727,7 @@ struct Args {
     #[arg(long, default_value_t = String::new())]
     prompt: String,
 
-    /// Tensor parallel size
+    /// Tensor parallelism size
     #[arg(long, default_value_t = 1)]
     tp_size: usize,
 
