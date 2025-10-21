@@ -163,27 +163,27 @@ struct Weights {
 
 impl Weights {
     fn from_buf_reader(rdr: &mut BufReader<File>, config: &Config) -> Self {
-        let head_size = config.dim / config.n_heads;
+        let head_dim = config.dim / config.n_heads;
         Self {
             token_embedding_table: read_vec::<f32>(rdr, config.vocab_size * config.dim), // (vocab_size, dim)
             rms_att_weight: read_vec::<f32>(rdr, config.n_layers * config.dim), // (layer, dim)
-            wq: read_vec::<f32>(rdr, config.n_layers * config.dim * config.dim), // (layer, n_heads * head_size, dim)
-            wk: read_vec::<f32>(rdr, config.n_layers * config.dim * config.dim), // (layer, n_heads * head_size, dim)
-            wv: read_vec::<f32>(rdr, config.n_layers * config.dim * config.dim), // (layer, n_heads * head_size, dim)
-            wo: read_vec::<f32>(rdr, config.n_layers * config.dim * config.dim), // (layer, dim, n_heads * head_size)
+            wq: read_vec::<f32>(rdr, config.n_layers * config.dim * config.dim), // (layer, n_heads, head_dim, dim)
+            wk: read_vec::<f32>(rdr, config.n_layers * config.dim * config.dim), // (layer, n_heads, head_dim, dim)
+            wv: read_vec::<f32>(rdr, config.n_layers * config.dim * config.dim), // (layer, n_heads, head_dim, dim)
+            wo: read_vec::<f32>(rdr, config.n_layers * config.dim * config.dim), // (layer, dim, n_heads * head_dim)
             rms_ffn_weight: read_vec::<f32>(rdr, config.n_layers * config.dim),  // (layer, dim)
             w1: read_vec::<f32>(rdr, config.n_layers * config.hidden_dim * config.dim), // (layer, hidden_dim, dim)
             w2: read_vec::<f32>(rdr, config.n_layers * config.dim * config.hidden_dim), // (layer, dim, hidden_dim)
             w3: read_vec::<f32>(rdr, config.n_layers * config.hidden_dim * config.dim), // (layer, hidden_dim, dim)
             rms_final_weight: read_vec::<f32>(rdr, config.dim),                         // (dim,)
-            freq_cis_real: read_vec::<f32>(rdr, config.max_seq_len * head_size / 2), // (max_seq_len, head_size/2)
-            freq_cis_imag: read_vec::<f32>(rdr, config.max_seq_len * head_size / 2), // (max_seq_len, head_size/2)
+            freq_cis_real: read_vec::<f32>(rdr, config.max_seq_len * head_dim / 2), // (max_seq_len, head_dim/2)
+            freq_cis_imag: read_vec::<f32>(rdr, config.max_seq_len * head_dim / 2), // (max_seq_len, head_dim/2)
         }
     }
 
     /// Create a shard of weights used by a single tensor parallel worker
     fn shard(&self, config: &Config, tp_size: usize, rank: usize) -> Self {
-        let head_size = config.dim / config.n_heads;
+        let head_dim = config.dim / config.n_heads;
         let n_heads_per_shard = config.n_heads / tp_size;
         let hidden_dim_per_shard = config.hidden_dim / tp_size;
         let mut wq = Vec::new();
@@ -196,22 +196,22 @@ impl Weights {
         for layer in 0..config.n_layers {
             let layer_offset = layer * config.dim * config.dim;
             wq.extend(
-                &self.wq[layer_offset + rank * n_heads_per_shard * head_size * config.dim
-                    ..layer_offset + (rank + 1) * n_heads_per_shard * head_size * config.dim],
+                &self.wq[layer_offset + rank * n_heads_per_shard * head_dim * config.dim
+                    ..layer_offset + (rank + 1) * n_heads_per_shard * head_dim * config.dim],
             );
             wk.extend(
-                &self.wk[layer_offset + rank * n_heads_per_shard * head_size * config.dim
-                    ..layer_offset + (rank + 1) * n_heads_per_shard * head_size * config.dim],
+                &self.wk[layer_offset + rank * n_heads_per_shard * head_dim * config.dim
+                    ..layer_offset + (rank + 1) * n_heads_per_shard * head_dim * config.dim],
             );
             wv.extend(
-                &self.wv[layer_offset + rank * n_heads_per_shard * head_size * config.dim
-                    ..layer_offset + (rank + 1) * n_heads_per_shard * head_size * config.dim],
+                &self.wv[layer_offset + rank * n_heads_per_shard * head_dim * config.dim
+                    ..layer_offset + (rank + 1) * n_heads_per_shard * head_dim * config.dim],
             );
             for r in 0..config.dim {
                 let row_offset = layer_offset + r * config.dim;
                 wo.extend(
-                    &self.wo[row_offset + rank * n_heads_per_shard * head_size
-                        ..row_offset + (rank + 1) * n_heads_per_shard * head_size],
+                    &self.wo[row_offset + rank * n_heads_per_shard * head_dim
+                        ..row_offset + (rank + 1) * n_heads_per_shard * head_dim],
                 );
             }
 
@@ -235,10 +235,10 @@ impl Weights {
         Self {
             token_embedding_table: self.token_embedding_table.clone(),
             rms_att_weight: self.rms_att_weight.clone(),
-            wq: wq, // (layer, n_heads_per_shard * head_size, dim)
-            wk: wk, // (layer, n_heads_per_shard * head_size, dim)
-            wv: wv, // (layer, n_heads_per_shard * head_size, dim)
-            wo: wo, // (layer, dim, n_heads_per_shard * head_size)
+            wq: wq, // (layer, n_heads_per_shard, head_dim, dim)
+            wk: wk, // (layer, n_heads_per_shard, head_dim, dim)
+            wv: wv, // (layer, n_heads_per_shard, head_dim, dim)
+            wo: wo, // (layer, dim, n_heads_per_shard * head_dim)
             rms_ffn_weight: self.rms_ffn_weight.clone(),
             w1: w1, // (layer, hidden_dim_per_shard, dim)
             w2: w2, // (layer, dim, hidden_dim_per_shard)
@@ -252,22 +252,22 @@ impl Weights {
 
 /// https://medium.com/@plienhar/llm-inference-series-3-kv-caching-unveiled-048152e461c8
 struct KVCache {
-    key_cache: Vec<f32>,   // (layer, max_seq_len, n_heads_per_shard * head_size)
-    value_cache: Vec<f32>, // (layer, max_seq_len, n_heads_per_shard * head_size)
+    key_cache: Vec<f32>,   // (layer, n_heads_per_shard, max_seq_len, head_dim)
+    value_cache: Vec<f32>, // (layer, n_heads_per_shard, max_seq_len, head_dim)
 }
 
 impl KVCache {
     fn new(config: &Config, tp_size: usize) -> Self {
-        let head_size = config.dim / config.n_heads;
+        let head_dim = config.dim / config.n_heads;
         let n_heads_per_shard = config.n_heads / tp_size;
         Self {
             key_cache: vec![
                 0.0;
-                config.n_layers * config.max_seq_len * n_heads_per_shard * head_size
+                config.n_layers * n_heads_per_shard * config.max_seq_len * head_dim
             ],
             value_cache: vec![
                 0.0;
-                config.n_layers * config.max_seq_len * n_heads_per_shard * head_size
+                config.n_layers * n_heads_per_shard * config.max_seq_len * head_dim
             ],
         }
     }
@@ -293,8 +293,7 @@ fn rmsnorm(x: &Vec<f32>, weight: &[f32]) -> Vec<f32> {
 
 fn matmul(x: &Vec<f32>, w: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     // x (m, k) @ w (n, k)^T -> (m, n)
-    let parallelism = 4;
-    assert!(n % parallelism == 0);
+    let parallelism = 2;
     let mut o = vec![0.0; m * n];
     let o_addr = o.as_mut_ptr() as usize;
     thread::scope(|s| {
@@ -303,7 +302,13 @@ fn matmul(x: &Vec<f32>, w: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
             s.spawn(move || {
                 let o_ptr = o_addr as *mut f32;
                 for r in 0..m {
-                    for c in t * (n / parallelism)..(t + 1) * (n / parallelism) {
+                    let start_col = t * (n / parallelism);
+                    let end_col = if t == parallelism - 1 {
+                        n // last thread calculates all remaining columns
+                    } else {
+                        (t + 1) * (n / parallelism)
+                    };
+                    for c in start_col..end_col {
                         let mut val: f32 = 0.0;
                         for i in 0..k {
                             val += x[r * k + i] * w[c * k + i];
@@ -349,11 +354,6 @@ impl Model {
     }
 }
 
-enum Stage {
-    Prefill,
-    Decode,
-}
-
 /// https://danieldk.eu/Tensor-Parallelism
 struct Worker {
     shard: Model,
@@ -378,36 +378,34 @@ impl Worker {
         }
 
         let mut kv_cache = KVCache::new(&self.shard.config, self.tp_size);
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
         // prefill
-        if prompt_tokens.len() > 1 {
-            self.inference(
-                prompt_tokens[0..prompt_tokens.len() - 1].to_vec(),
-                0,
-                &mut kv_cache,
-                Stage::Prefill,
+        let logits = self.inference(&prompt_tokens, 0, &mut kv_cache);
+        let logits = logits[(prompt_tokens.len() - 1) * self.shard.config.vocab_size..].to_vec(); // logits of the last token
+        let mut next_token = self.sample(logits, &mut rng, temperature);
+        let mut next_token_pos: usize = prompt_tokens.len();
+        if self.rank == 0 && next_token_pos < steps {
+            print!(
+                "{}",
+                String::from_utf8(self.tokenizer.decode(next_token)).unwrap()
             );
+            stdout().flush().unwrap();
         }
 
         // decode
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let mut pos: usize = prompt_tokens.len() - 1;
-        let mut token: usize = prompt_tokens[prompt_tokens.len() - 1];
-        while pos < steps {
-            let logits = self.inference(vec![token], pos, &mut kv_cache, Stage::Decode);
-
-            let next = self.sample(logits, &mut rng, temperature);
+        while next_token_pos < steps {
+            let logits = self.inference(&vec![next_token], next_token_pos, &mut kv_cache);
+            next_token = self.sample(logits, &mut rng, temperature);
+            next_token_pos += 1;
 
             if self.rank == 0 {
                 print!(
                     "{}",
-                    String::from_utf8(self.tokenizer.decode(next)).unwrap()
+                    String::from_utf8(self.tokenizer.decode(next_token)).unwrap()
                 );
                 stdout().flush().unwrap();
             }
-
-            token = next;
-            pos += 1;
         }
     }
 
@@ -459,29 +457,27 @@ impl Worker {
 
     fn inference(
         &self,
-        tokens: Vec<usize>,
+        tokens: &Vec<usize>,
         pos: usize, // pos of the first token in tokens
         kv_cache: &mut KVCache,
-        stage: Stage,
     ) -> Vec<f32> {
         let config = &self.shard.config;
         let weights = &self.shard.weights;
-        let head_size = config.dim / config.n_heads;
+        let head_dim = config.dim / config.n_heads;
         let n_heads_per_shard = config.n_heads / self.tp_size;
         let hidden_dim_per_shard = config.hidden_dim / self.tp_size;
+        let seq_len = pos + tokens.len();
 
         // positional embedding
         let freq_cis_real_row =
-            &weights.freq_cis_real[pos * (head_size / 2)..(pos + tokens.len()) * (head_size / 2)];
+            &weights.freq_cis_real[pos * (head_dim / 2)..(pos + tokens.len()) * (head_dim / 2)];
         let freq_cis_imag_row =
-            &weights.freq_cis_imag[pos * (head_size / 2)..(pos + tokens.len()) * (head_size / 2)];
+            &weights.freq_cis_imag[pos * (head_dim / 2)..(pos + tokens.len()) * (head_dim / 2)];
 
         // embed tokens into input vector x
         let mut x: Vec<f32> = Vec::new(); // (n, dim)
         for token in tokens.iter() {
-            x.extend(
-                &weights.token_embedding_table[token * (config.dim)..(token + 1) * (config.dim)],
-            );
+            x.extend(&weights.token_embedding_table[token * config.dim..(token + 1) * config.dim]);
         }
 
         // run through layers
@@ -489,122 +485,125 @@ impl Worker {
             // pre-attention norm
             let rms_normed_x = rmsnorm(
                 &x,
-                &weights.rms_att_weight[layer * (config.dim)..(layer + 1) * (config.dim)],
+                &weights.rms_att_weight[layer * config.dim..(layer + 1) * config.dim],
             );
 
-            // qkv projection
-            let mut query = matmul(
-                &rms_normed_x,
-                &weights.wq[layer * (n_heads_per_shard * head_size) * (config.dim)
-                    ..(layer + 1) * (n_heads_per_shard * head_size) * (config.dim)],
-                tokens.len(),
-                config.dim,
-                n_heads_per_shard * head_size,
-            ); // rms_normed_x (n, dim) @ wq^T (dim, n_heads_per_shard * head_size) -> query (n, n_heads_per_shard * head_size)
-            let mut key = matmul(
-                &rms_normed_x,
-                &weights.wk[layer * (n_heads_per_shard * head_size) * (config.dim)
-                    ..(layer + 1) * (n_heads_per_shard * head_size) * (config.dim)],
-                tokens.len(),
-                config.dim,
-                n_heads_per_shard * head_size,
-            ); // rms_normed_x (n, dim) @ wk^T (dim, n_heads_per_shard * head_size) -> key (n, n_heads_per_shard * head_size)
-            let value = matmul(
-                &rms_normed_x,
-                &weights.wv[layer * (n_heads_per_shard * head_size) * (config.dim)
-                    ..(layer + 1) * (n_heads_per_shard * head_size) * (config.dim)],
-                tokens.len(),
-                config.dim,
-                n_heads_per_shard * head_size,
-            ); // rms_normed_x (n, dim) @ wv^T (dim, n_heads_per_shard * head_size) -> value (n, n_heads_per_shard * head_size)
+            let mut attention_output = vec![0.0; tokens.len() * n_heads_per_shard * head_dim];
 
-            // rotary positional embedding
-            for ti in 0..tokens.len() {
-                for head in 0..n_heads_per_shard {
-                    let token_offset = ti * (n_heads_per_shard * head_size);
-                    let head_query = &mut query
-                        [token_offset + head * head_size..token_offset + (head + 1) * head_size];
-                    let head_key = &mut key
-                        [token_offset + head * head_size..token_offset + (head + 1) * head_size];
-                    for i in 0..(head_size / 2) {
+            for head in 0..n_heads_per_shard {
+                // qkv projection
+                let layer_offset = layer * n_heads_per_shard * head_dim * config.dim;
+                let mut query = matmul(
+                    &rms_normed_x,
+                    &weights.wq[layer_offset + head * head_dim * config.dim
+                        ..layer_offset + (head + 1) * head_dim * config.dim],
+                    tokens.len(),
+                    config.dim,
+                    head_dim,
+                ); // rms_normed_x (n, dim) @ wq^T (dim, head_dim) -> query (n, head_dim)
+                let mut key = matmul(
+                    &rms_normed_x,
+                    &weights.wk[layer_offset + head * head_dim * config.dim
+                        ..layer_offset + (head + 1) * head_dim * config.dim],
+                    tokens.len(),
+                    config.dim,
+                    head_dim,
+                ); // rms_normed_x (n, dim) @ wk^T (dim, head_dim) -> key (n, head_dim)
+                let value = matmul(
+                    &rms_normed_x,
+                    &weights.wv[layer_offset + head * head_dim * config.dim
+                        ..layer_offset + (head + 1) * head_dim * config.dim],
+                    tokens.len(),
+                    config.dim,
+                    head_dim,
+                ); // rms_normed_x (n, dim) @ wv^T (dim, head_dim) -> value (n, head_dim)
+
+                // rotary positional embedding
+                for ti in 0..tokens.len() {
+                    let token_query = &mut query[ti * head_dim..(ti + 1) * head_dim];
+                    let token_key = &mut key[ti * head_dim..(ti + 1) * head_dim];
+                    for i in 0..(head_dim / 2) {
                         let (fcr, fci) = (
-                            freq_cis_real_row[ti * (head_size / 2) + i],
-                            freq_cis_imag_row[ti * (head_size / 2) + i],
+                            freq_cis_real_row[ti * (head_dim / 2) + i],
+                            freq_cis_imag_row[ti * (head_dim / 2) + i],
                         );
                         // rotate
-                        (head_query[i * 2], head_query[i * 2 + 1]) = (
-                            head_query[i * 2] * fcr - head_query[i * 2 + 1] * fci,
-                            head_query[i * 2] * fci + head_query[i * 2 + 1] * fcr,
+                        (token_query[i * 2], token_query[i * 2 + 1]) = (
+                            token_query[i * 2] * fcr - token_query[i * 2 + 1] * fci,
+                            token_query[i * 2] * fci + token_query[i * 2 + 1] * fcr,
                         );
-                        (head_key[i * 2], head_key[i * 2 + 1]) = (
-                            head_key[i * 2] * fcr - head_key[i * 2 + 1] * fci,
-                            head_key[i * 2] * fci + head_key[i * 2 + 1] * fcr,
+                        (token_key[i * 2], token_key[i * 2 + 1]) = (
+                            token_key[i * 2] * fcr - token_key[i * 2 + 1] * fci,
+                            token_key[i * 2] * fci + token_key[i * 2 + 1] * fcr,
                         );
                     }
                 }
-            }
 
-            // cache kv values
-            let layer_offset = layer * config.max_seq_len * n_heads_per_shard * head_size;
-            kv_cache.key_cache[(layer_offset + pos * n_heads_per_shard * head_size)
-                ..(layer_offset + (pos + tokens.len()) * n_heads_per_shard * head_size)]
-                .copy_from_slice(&key);
-            kv_cache.value_cache[(layer_offset + pos * n_heads_per_shard * head_size)
-                ..(layer_offset + (pos + tokens.len()) * n_heads_per_shard * head_size)]
-                .copy_from_slice(&value);
+                // cache kv values
+                let head_offset = layer * n_heads_per_shard * config.max_seq_len * head_dim
+                    + head * config.max_seq_len * head_dim;
+                kv_cache.key_cache[(head_offset + pos * head_dim)
+                    ..(head_offset + (pos + tokens.len()) * head_dim)]
+                    .copy_from_slice(&key);
+                kv_cache.value_cache[(head_offset + pos * head_dim)
+                    ..(head_offset + (pos + tokens.len()) * head_dim)]
+                    .copy_from_slice(&value);
 
-            let mut attention_output = vec![0.0; tokens.len() * n_heads_per_shard * head_size];
-            // multihead attention
-            for ti in 0..tokens.len() {
-                for head in 0..n_heads_per_shard {
-                    let token_query = &query[ti * n_heads_per_shard * head_size
-                        ..(ti + 1) * n_heads_per_shard * head_size];
-                    let head_query = &token_query[head * head_size..(head + 1) * head_size];
-                    let mut scores = vec![0.0; pos + ti + 1];
-                    for i in 0..(pos + ti + 1) {
-                        let head_key_offset =
-                            layer_offset + i * n_heads_per_shard * head_size + head * head_size;
-                        let head_key =
-                            &kv_cache.key_cache[head_key_offset..(head_key_offset + head_size)]; // key of the i-th position
-                        // compute attention score
-                        scores[i] = head_query
-                            .iter()
-                            .zip(head_key.iter()) // (head_query[i], head_key[i]) pairs
-                            .map(|(&qi, &ki)| qi * ki)
-                            .sum::<f32>()
-                            / (head_size as f32).sqrt();
+                // Attention(Q, K, V, M) = softmax(Q * K^T / sqrt(d) + M) * V
+                let mut scores = matmul(
+                    &query,
+                    &kv_cache.key_cache[head_offset..(head_offset + seq_len * head_dim)],
+                    tokens.len(),
+                    head_dim,
+                    seq_len,
+                ); // query (n, head_dim) @ key^T (head_dim, seq_len) -> scores (n, seq_len)
+                scores
+                    .iter_mut()
+                    .for_each(|score| *score /= (head_dim as f32).sqrt());
+
+                // mask
+                // https://gmongaras.medium.com/how-do-self-attention-masks-work-72ed9382510f
+                for row in 0..tokens.len() {
+                    for col in 0..seq_len {
+                        scores[row * seq_len + col] = if col <= (pos + row) {
+                            scores[row * seq_len + col]
+                        } else {
+                            // cannot attend to future tokens
+                            -f32::INFINITY
+                        };
                     }
+                }
 
-                    softmax(&mut scores);
+                for row in 0..tokens.len() {
+                    softmax(&mut scores[row * seq_len..(row + 1) * seq_len]);
+                }
 
-                    let token_attention_output =
-                        &mut attention_output[ti * n_heads_per_shard * head_size
-                            ..(ti + 1) * n_heads_per_shard * head_size];
-                    let head_attention_output =
-                        &mut token_attention_output[head * head_size..(head + 1) * head_size];
-                    // weighted sum of values
-                    for i in 0..(pos + ti + 1) {
-                        let head_value_offset =
-                            layer_offset + i * n_heads_per_shard * head_size + head * head_size;
+                // weighted sum of values
+                for ti in 0..tokens.len() {
+                    let token_offset = ti * n_heads_per_shard * head_dim;
+                    let head_attention_output = &mut attention_output
+                        [token_offset + head * head_dim..token_offset + (head + 1) * head_dim];
+                    for i in 0..seq_len {
+                        let score = scores[ti * seq_len + i];
                         let head_value = &kv_cache.value_cache
-                            [head_value_offset..(head_value_offset + head_size)]; // value of the i-th position
-                        let score = scores[i];
+                            [head_offset + i * head_dim..head_offset + (i + 1) * head_dim]; // value of the i-th position
                         head_attention_output
                             .iter_mut()
                             .zip(head_value)
                             .for_each(|(oi, &vi)| *oi += score * vi);
                     }
-                }
+                } // scores (n, seq_len) @ value (seq_len, head_dim) -> head_attention_output (n, head_dim)
             }
+
             // output projection
             let attention_output = matmul(
                 &attention_output,
-                &weights.wo[layer * (config.dim) * (n_heads_per_shard * head_size)
-                    ..(layer + 1) * (config.dim) * (n_heads_per_shard * head_size)],
+                &weights.wo[layer * config.dim * (n_heads_per_shard * head_dim)
+                    ..(layer + 1) * config.dim * (n_heads_per_shard * head_dim)],
                 tokens.len(),
-                n_heads_per_shard * head_size,
+                n_heads_per_shard * head_dim,
                 config.dim,
-            ); // attention_output (n, n_heads_per_shard * head_size) @ wo^T (n_heads_per_shard * head_size, dim) -> attention_output (n, dim)
+            ); // attention_output (n, n_heads_per_shard * head_dim) @ wo^T (n_heads_per_shard * head_dim, dim) -> attention_output (n, dim)
 
             let attention_output = self.all_reduce(attention_output);
 
@@ -616,22 +615,22 @@ impl Worker {
             // pre-ffn rmsnorm
             let rms_normed_x = rmsnorm(
                 &x,
-                &weights.rms_ffn_weight[layer * (config.dim)..(layer + 1) * (config.dim)],
+                &weights.rms_ffn_weight[layer * config.dim..(layer + 1) * config.dim],
             );
 
             // FFN block: self.w2(F.silu(self.w1(x)) * self.w3(x))
             let mut fnn1 = matmul(
                 &rms_normed_x,
-                &weights.w1[layer * hidden_dim_per_shard * (config.dim)
-                    ..(layer + 1) * hidden_dim_per_shard * (config.dim)],
+                &weights.w1[layer * hidden_dim_per_shard * config.dim
+                    ..(layer + 1) * hidden_dim_per_shard * config.dim],
                 tokens.len(),
                 config.dim,
                 hidden_dim_per_shard,
             ); // rms_normed_x (n, dim) @ w1^T (dim, hidden_dim_per_shard)  -> fnn1 (n, hidden_dim_per_shard)
             let fnn3 = matmul(
                 &rms_normed_x,
-                &weights.w3[layer * hidden_dim_per_shard * (config.dim)
-                    ..(layer + 1) * hidden_dim_per_shard * (config.dim)],
+                &weights.w3[layer * hidden_dim_per_shard * config.dim
+                    ..(layer + 1) * hidden_dim_per_shard * config.dim],
                 tokens.len(),
                 config.dim,
                 hidden_dim_per_shard,
@@ -646,8 +645,8 @@ impl Worker {
 
             let fnn_output = matmul(
                 &fnn1,
-                &weights.w2[layer * (config.dim) * hidden_dim_per_shard
-                    ..(layer + 1) * (config.dim) * hidden_dim_per_shard],
+                &weights.w2[layer * config.dim * hidden_dim_per_shard
+                    ..(layer + 1) * config.dim * hidden_dim_per_shard],
                 tokens.len(),
                 hidden_dim_per_shard,
                 config.dim,
@@ -659,10 +658,6 @@ impl Worker {
             x.iter_mut()
                 .zip(fnn_output.iter())
                 .for_each(|(xi, &oi)| *xi += oi);
-        }
-
-        if matches!(stage, Stage::Prefill) {
-            return Vec::new();
         }
 
         // final rmsnorm
