@@ -636,11 +636,10 @@ impl Worker {
                 hidden_dim_per_shard,
             ); // rms_normed_x (n, dim) @ w3^T (dim, hidden_dim_per_shard) @  -> fnn3 (n, hidden_dim_per_shard)
 
-            // apply silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
+            // apply silu(x) = x*σ(x) where σ(x) is the logistic sigmoid
             fnn1.iter_mut()
                 .for_each(|a| *a = *a * (1.0 / (1.0 + (-*a).exp())));
 
-            // elementwise multiply with hb2=w3(x) into hb
             fnn1.iter_mut().zip(fnn3.iter()).for_each(|(a, &b)| *a *= b);
 
             let fnn_output = matmul(
