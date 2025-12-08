@@ -283,12 +283,39 @@ impl Tokenizer {
 
     /// Encode a string into a list of tokens
     fn encode(&self, text: &str) -> Vec<Token> {
-        unimplemented!();
+        let mut tokens: Vec<Token> = text.as_bytes().iter().map(|b| *b as Token).collect();
+
+        loop {
+            let mut best = (usize::MAX, Token::MAX);
+
+            for i in 0..tokens.len() - 1 {
+                let token_pair = (tokens[i], tokens[i + 1]);
+                if let Some(merged_token) = self.merges.get(&token_pair) {
+                    if *merged_token < best.1 {
+                        best = (i, *merged_token);
+                    }
+                }
+            }
+
+            if best.1 == Token::MAX {
+                break; // no more possible merges
+            }
+
+            // perform merge
+            tokens[best.0] = best.1;
+            tokens.remove(best.0 + 1);
+        }
+
+        tokens
     }
 
     /// Decode a list of tokens into a string
     fn decode(&self, tokens: &[Token]) -> String {
-        unimplemented!();
+        let mut bytes = Vec::new();
+        for token in tokens {
+            bytes.extend_from_slice(&self.vocab[token]);
+        }
+        String::from_utf8(bytes).unwrap()
     }
 }
 
@@ -318,4 +345,5 @@ fn main() {
         elapsed_time.as_secs(),
         elapsed_time.subsec_millis()
     );
+    assert_eq!(tokenizer.decode(&tokenizer.encode("amp")), "amp");
 }
